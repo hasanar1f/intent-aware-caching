@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intent-aware-caching"
+version = "0.1.0"
+description = "Intent-Aware Caching (IAC) for LLM serving"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp",
+    "datasets",
+    "huggingface_hub",
+    "numpy",
+    "pyarrow",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    "tqdm",
+    "transformers",
+]
+
+[tool.setuptools]
+packages = ["iac"]

@@ -1,0 +1,303 @@
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 17ecfa7..160996c 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -1010,6 +1010,10 @@ class OpenAIServingChat(OpenAIServingBase):
+             tool_call_constraint=processed_messages.tool_call_constraint,
+             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
+         )
++        if self.tokenizer_manager.server_args.radix_eviction_policy == "iac":
++            from iac.serving import attach_chat_metadata
++
++            sampling_params = attach_chat_metadata(sampling_params, request.messages)
+ 
+         # Handle single vs multiple requests
+         if request.input_ids is not None:
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index bccbf46..900fe6a 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -261,6 +261,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
+     SchedulerRecvSkipper,
+ )
+ from sglang.srt.managers.scheduler_components.request_receiver import (
++    IACLabelUpdate,
+     SchedulerRequestReceiver,
+ )
+ from sglang.srt.managers.scheduler_components.weight_updater import (
+@@ -597,6 +598,12 @@ class Scheduler(
+                 cache_controller.load_fence_stream = (
+                     self.tp_worker.model_runner.forward_stream
+                 )
++
++        self.iac_runtime = None
++        if self.server_args.radix_eviction_policy == "iac":
++            from iac.serving import init_runtime
++
++            self.iac_runtime = init_runtime(self)
+         self.emit_metrics_constants()
+         self.maybe_init_hccl_dp_prewarm()
+ 
+@@ -1624,6 +1631,7 @@ class Scheduler(
+                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
+                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                 (AbortReq, self.abort_request),
++                (IACLabelUpdate, self.handle_iac_label_update),
+                 (OpenSessionReqInput, self.open_session),
+                 (CloseSessionReqInput, self.close_session),
+                 (
+@@ -3015,9 +3023,14 @@ class Scheduler(
+             )
+             self._prefetch_kvcache(req)
+ 
++    def handle_iac_label_update(self, recv_req: IACLabelUpdate):
++        self.iac_runtime.apply_labels(recv_req)
++
+     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+         if not self._set_or_validate_priority(req):
+             return
++        if self.iac_runtime is not None:
++            self.iac_runtime.on_new_request(req)
+         if self.disaggregation_mode == DisaggregationMode.NULL:
+             if self._abort_on_queued_limit(req):
+                 return
+diff --git a/python/sglang/srt/managers/scheduler_components/request_receiver.py b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+index a18dac6..f664c19 100644
+--- a/python/sglang/srt/managers/scheduler_components/request_receiver.py
++++ b/python/sglang/srt/managers/scheduler_components/request_receiver.py
+@@ -51,6 +51,18 @@ if TYPE_CHECKING:
+ logger = logging.getLogger(__name__)
+ 
+ 
++try:
++    from iac.serving import IACLabelUpdate
++    from iac.serving import label_messages as iac_label_messages
++except ImportError:
++
++    class IACLabelUpdate:
++        pass
++
++    def iac_label_messages() -> list:
++        return []
++
++
+ @dataclass(kw_only=True, slots=True, frozen=True)
+ class SchedulerRequestReceiver:
+     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
+@@ -138,6 +150,7 @@ class SchedulerRequestReceiver:
+                     except zmq.ZMQError:
+                         break
+                     recv_reqs.append(recv_rpc)
++                recv_reqs.extend(iac_label_messages())
+             else:
+                 recv_reqs = None
+         else:
+@@ -324,6 +337,7 @@ class SchedulerRequestReceiver:
+                     TokenizedEmbeddingReqInput,
+                     BatchTokenizedGenerateReqInput,
+                     BatchTokenizedEmbeddingReqInput,
++                    IACLabelUpdate,
+                 ),
+             )
+         ]
+@@ -337,6 +351,7 @@ class SchedulerRequestReceiver:
+                     TokenizedEmbeddingReqInput,
+                     BatchTokenizedGenerateReqInput,
+                     BatchTokenizedEmbeddingReqInput,
++                    IACLabelUpdate,
+                 ),
+             )
+         ]
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 8954842..bfc2590 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1358,6 +1358,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             custom_params = dict(sampling_kwargs.get("custom_params") or {})
+             custom_params["thinking_budget"] = obj.max_thinking_tokens
+             sampling_kwargs["custom_params"] = custom_params
++        if (
++            isinstance(obj, GenerateReqInput)
++            and self.server_args.radix_eviction_policy == "iac"
++        ):
++            from iac.serving import stamp_arrival
++
++            sampling_kwargs = stamp_arrival(sampling_kwargs, time.time())
+         sampling_params = self.sampling_params_class(**sampling_kwargs)
+         sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
+diff --git a/python/sglang/srt/mem_cache/base_prefix_cache.py b/python/sglang/srt/mem_cache/base_prefix_cache.py
+index 2998b18..eac37b6 100644
+--- a/python/sglang/srt/mem_cache/base_prefix_cache.py
++++ b/python/sglang/srt/mem_cache/base_prefix_cache.py
+@@ -78,6 +78,7 @@ class InsertParams:
+     chunked: bool = False
+     priority: int = 0
+     track_adopted_ranges: bool = False
++    iac_tag: Any = None
+ 
+ 
+ @dataclasses.dataclass
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+index 5d3a02c..88a933e 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -127,6 +127,8 @@ class UnifiedTreeNode:
+         self.hit_count = 0
+         self.external_cache_stored = False
+         self.priority = priority
++        self.iac_tag = None
++        self.iac_time = 0.0
+         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
+             _NUM_COMPONENT_TYPES * 2
+         )
+@@ -894,6 +896,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         prefix_chunks.reverse()
+         return torch.cat(prefix_chunks)
+ 
++    @staticmethod
++    def _iac_stamp(node: UnifiedTreeNode, params: InsertParams) -> None:
++        tag = params.iac_tag
++        if tag is not None and (node.iac_tag is None or tag.timestamp >= node.iac_time):
++            node.iac_tag = tag
++            node.iac_time = tag.timestamp
++
+     def _touch_node(self, node: UnifiedTreeNode):
+         node.last_access_time = get_and_increase_time_counter()
+         if node != self.root_node:
+@@ -1031,6 +1040,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+             if action is not None:
+                 step_actions.append(action)
+         node.priority = max(node.priority, state.priority)
++        self._iac_stamp(node, state.params)
+ 
+         if node.evicted:
+             self._unevict_node_on_insert(node, state.value[:prefix_len])
+@@ -1097,6 +1107,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+             state.target_node = self._add_new_node(
+                 state.node, state.key, state.value, priority=state.priority
+             )
++            self._iac_stamp(state.target_node, state.params)
+             state.is_new_leaf = True
+         else:
+             state.target_node = state.node
+@@ -1165,6 +1176,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         new_node.hit_count = child.hit_count
+         new_node.external_cache_stored = child.external_cache_stored
+         new_node.creation_time = child.creation_time
++        new_node.iac_tag = child.iac_tag
++        new_node.iac_time = child.iac_time
+         # Split fragments stay on the anchor's root path for the ack's walk.
+         new_node.load_back_pending_id = child.load_back_pending_id
+ 
+@@ -1912,6 +1925,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         new_node.parent = node
+         new_node.key = key
+         new_node.hash_value = hash_value
++        new_node.iac_tag = node.iac_tag
++        new_node.iac_time = node.iac_time
+         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
+         node.children[child_key] = new_node
+         self._update_evictable_leaf_sets(new_node)
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 5cb53fa..2d370a1 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -859,6 +859,7 @@ class UnifiedRadixCache(BasePrefixCache):
+             insert_params = InsertParams(
+                 prev_prefix_len=req.kv.cache_protected_len,
+                 priority=getattr(req, "priority", 0) or 0,
++                iac_tag=getattr(req, "iac_tag", None),
+             )
+ 
+             # components prepare insert data + return effective cache_len
+@@ -944,6 +945,7 @@ class UnifiedRadixCache(BasePrefixCache):
+             prev_prefix_len=req.kv.cache_protected_len,
+             chunked=chunked,
+             priority=getattr(req, "priority", 0) or 0,
++            iac_tag=getattr(req, "iac_tag", None),
+         )
+         effective_cache_len = len(token_ids)
+         for comp in self._components_tuple:
+diff --git a/python/sglang/srt/mem_cache/utils.py b/python/sglang/srt/mem_cache/utils.py
+index 3ce48d3..324d24c 100644
+--- a/python/sglang/srt/mem_cache/utils.py
++++ b/python/sglang/srt/mem_cache/utils.py
+@@ -53,6 +53,13 @@ from sglang.srt.mem_cache.evict_policy import (
+     SLRUStrategy,
+ )
+ 
++
++def _iac_strategy() -> EvictionStrategy:
++    from iac.serving import eviction_strategy
++
++    return eviction_strategy()
++
++
+ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+     "lru": LRUStrategy,
+     "lfu": LFUStrategy,
+@@ -61,6 +68,7 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
+     "filo": FILOStrategy,
+     "priority": PriorityStrategy,
+     "slru": SLRUStrategy,
++    "iac": _iac_strategy,
+ }
+ 
+ 
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index fa4b80e..a37ada7 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -326,6 +326,7 @@ add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
+ 
+ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+ add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
++add_radix_eviction_policy_choices(["iac"])
+ 
+ # --- Reinforcement learning ---
+ 
+@@ -846,6 +847,43 @@ class ServerArgs:
+         ),
+         NS("memory"),
+     ] = "lru"
++    iac_classifier_path: A[
++        Optional[str],
++        "IAC: intent classifier checkpoint (unset: every intent is 'unknown').",
++        NS("memory"),
++    ] = None
++    iac_stats_path: A[
++        Optional[str],
++        "IAC: reuse statistics JSON, the prior of the online statistics.",
++        NS("memory"),
++    ] = None
++    iac_clock: A[
++        str,
++        Arg(
++            help="IAC clock: server arrival (wall) or client iac_timestamp (request).",
++            choices=["wall", "request"],
++        ),
++        NS("memory"),
++    ] = "wall"
++    iac_classifier_device: A[
++        Optional[str],
++        "IAC: classifier device (default: the scheduler's GPU).",
++        NS("memory"),
++    ] = None
++    iac_classifier_dtype: A[
++        str,
++        Arg(help="IAC: classifier dtype.", choices=["bf16", "autocast-bf16", "fp32"]),
++        NS("memory"),
++    ] = "bf16"
++    iac_classifier_max_batch: A[int, "IAC: classifier batch size.", NS("memory")] = 64
++    iac_horizon: A[float, "IAC: reuse horizon (seconds).", NS("memory")] = 40.0
++    iac_shrinkage: A[float, "IAC: shrinkage pseudo-counts.", NS("memory")] = 20.0
++    iac_window: A[int, "IAC: requests the online statistics use.", NS("memory")] = 50000
++    iac_update_interval: A[
++        float,
++        "IAC: seconds between online statistics updates.",
++        NS("memory"),
++    ] = 60.0
+     prefill_only_disable_kv_cache: A[
+         bool,
+         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
